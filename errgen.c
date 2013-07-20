@@ -203,6 +203,7 @@ static int errgen_setup(struct errgen_ctx *ctx, int argc, char *argv[])
 
 	info("  monitor hostname: %s", ctx->conf.address);
 	info("  port: %d", ctx->conf.port);
+	info("  control port: %d", ctx->conf.ctl_port);
 	info("  uuid: %s", ctx->conf.uuid);
 	info("  timeout: %d", ctx->conf.timeout);
 
@@ -338,6 +339,7 @@ static void errgen_loop(struct errgen_ctx *ctx)
 	pid_t pid = getpid();
 	struct monitor_pkt_s pkt;
 
+	errgen_start_ctl_loop(ctx);
 	while (need_run) {
 		get_report(ctx, &pkt);
 		send_report(ctx, &pkt);
@@ -387,7 +389,6 @@ int main(int argc, char *argv[])
 		exit(3);
 	}
 
-	errgen_start_ctl_loop(ctx);
 	errgen_loop(ctx);
 
 	info("terminating...");

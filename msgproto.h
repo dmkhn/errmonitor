@@ -18,8 +18,8 @@ struct monitor_pkt_s {
 
 enum monitor_cmd {
 	MONITOR_CMD_DUMMY = 0,
-	MONITOR_CMD_GRACEFULL_KILL,
 	MONITOR_CMD_KILL,
+	MONITOR_CMD_GRACEFULL_KILL,
 };
 
 struct monitor_ctl_pkt_s {
