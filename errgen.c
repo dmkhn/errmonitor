@@ -1,54 +1,27 @@
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
 #include <zmq.h>
 #include <getopt.h>
-#include <syslog.h>
+#include <pthread.h>
 
+#include "common.h"
+#include "log.h"
 #include "msgproto.h"
 
 #define ERRGEN_DEFAULT_SYSLOGNAME  "errgen"
-#define ERRGEN_DEFAULT_TIMEOUT     5000 // 5sec
-
-/** Verbosity requested from command line */
-static int verbosity = 1;
+#define ERRGEN_DEFAULT_TIMEOUT     5 // 5sec
 
 static int need_run = 1;
-
-void __attribute__((__format__(__printf__,2,3)))
-do_log(int level, const char *fmt, ...)
-{
-	va_list ap;
-
-	if (level <= verbosity) {
-		va_start(ap, fmt);
-		vsyslog(LOG_INFO, fmt, ap);
-		va_end(ap);
-	}
-}
-
-void error(const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	vsyslog(LOG_ERR, fmt, ap);
-	va_end(ap);
-}
-
-#define info(...) do_log(1, __VA_ARGS__)
-#define debug(...) do_log(2, __VA_ARGS__)
-#define verbose(...) do_log(3, __VA_ARGS__)
 
 #define MAX_UUID_LEN    DETECTOR_SIZE
 #define MAX_ADDRESS_LEN 64
 
 struct errgen_cfg {
 	int port;
+	int ctl_port;
 	char address[MAX_ADDRESS_LEN];
 	char uuid[MAX_UUID_LEN];
 	int timeout;
@@ -58,8 +31,9 @@ struct errgen_ctx {
 	struct errgen_cfg conf;
 	void *zmq_ctx;
 	void *zmq_sock;
+	void *zmq_ctl_sock;
 	int cnt;
-	pid_t pid;
+	pthread_t ctl_thread;
 };
 
 static void print_version(const char *argv0) {
@@ -74,24 +48,26 @@ static void print_help(const char *argv0) {
 		"    -h --help                Show this help\n"
 		"    -v --version             Show version\n"
 		"    -p --port=NUM            Set monitor port\n"
+		"    -c --ctl-port=NUM        Set monitor control port\n"
 		"    -a --address=ADDR        Set monitor hostname\n"
 		"    -u --uuid=STRING         Set UUID of the client\n"
-		"    -t --timeout=NUM         Set timeout in secs to generate err report\n"
-		"    -d --debug               Increase output verbosity\n"
+		"    -t --timeout=NUM         Set timeout (secs) to generate err report\n"
+		"    -g --debug               Increase output verbosity\n"
 		"\n", argv0);
 }
 
 static int parse_command_line(struct errgen_cfg *cfg,
 		int argc, char *argv[]) {
 	int opt, len;
-	static const struct option long_options[] = {
+	const struct option long_options[] = {
 		{ "version",	no_argument,		NULL, 'v' },
 		{ "help",		no_argument,		NULL, 'h' },
-		{ "debug",		no_argument,		NULL, 'd' },
+		{ "debug",		no_argument,		NULL, 'g' },
 		{ "uuid",		required_argument,	NULL, 'u' },
-		{ "port",		optional_argument,	NULL, 'p' },
-		{ "address",	optional_argument,	NULL, 'a' },
-		{ "timeout",	optional_argument,	NULL, 't' },
+		{ "port",		required_argument,	NULL, 'p' },
+		{ "ctl-port",	required_argument,	NULL, 'c' },
+		{ "address",	required_argument,	NULL, 'a' },
+		{ "timeout",	required_argument,	NULL, 't' },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -100,8 +76,8 @@ static int parse_command_line(struct errgen_cfg *cfg,
 		exit(0);
 	}
 
-	while ((opt = getopt_long(argc, argv, "hvd:u:p:a:t",
-			long_options, NULL)) >= 0) {
+	while ((opt = getopt_long(argc, argv, "vhgupat:",
+			long_options, NULL)) != -1) {
 		switch(opt) {
 		case 'h':
 			print_help(argv[0]);
@@ -113,7 +89,7 @@ static int parse_command_line(struct errgen_cfg *cfg,
 			exit(0);
 			break;
 
-		case 'd':
+		case 'g':
 			verbosity++;
 			break;
 
@@ -127,6 +103,10 @@ static int parse_command_line(struct errgen_cfg *cfg,
 
 		case 'p':
 			cfg->port = atoi(optarg);
+			break;
+
+		case 'c':
+			cfg->ctl_port = atoi(optarg);
 			break;
 
 		case 'a':
@@ -157,9 +137,9 @@ static int parse_command_line(struct errgen_cfg *cfg,
 static int errgen_cfg_init(struct errgen_cfg *cfg)
 {
 	cfg->port = DEFAULT_PORT;
+	cfg->ctl_port = DEFAULT_CTL_PORT;
 	cfg->timeout = ERRGEN_DEFAULT_TIMEOUT;
 	strcpy(cfg->address, DEFAULT_ADDRESS);
-
 	return 0;
 }
 
@@ -226,22 +206,108 @@ static int errgen_setup(struct errgen_ctx *ctx, int argc, char *argv[])
 	info("  uuid: %s", ctx->conf.uuid);
 	info("  timeout: %d", ctx->conf.timeout);
 
-	ctx->pid = getpid();
-
 	return 0;
 }
 
 static int connect_to_server(struct errgen_ctx *ctx)
 {
-	char uri[MAX_ADDRESS_LEN];
+	char uri[MONITOR_MAX_STR_SZ];
+	int rv;
 
 	info("Connecting to monitor at %s:%d...",
 			ctx->conf.address, ctx->conf.port);
+
 	ctx->zmq_ctx = zmq_ctx_new();
+	if (!ctx->zmq_ctx) {
+		error("failed to create zmq context");
+		return -1;
+	}
+
 	ctx->zmq_sock = zmq_socket(ctx->zmq_ctx, ZMQ_REQ);
-	snprintf(uri, MAX_ADDRESS_LEN, "tcp://%s:%d",
+	if (!ctx->zmq_sock) {
+		error("failed to create zmq socket");
+		return -1;
+	}
+
+	ctx->zmq_ctl_sock = zmq_socket(ctx->zmq_ctx, ZMQ_REQ);
+	if (!ctx->zmq_ctl_sock) {
+		error("failed to create zmq control socket");
+		return -1;
+	}
+
+	snprintf(uri, MONITOR_MAX_STR_SZ, "tcp://%s:%d",
 			ctx->conf.address, ctx->conf.port);
-	return zmq_connect(ctx->zmq_sock, uri);
+	rv = zmq_connect(ctx->zmq_sock, uri);
+	debug("packet --> zmq_connect(%s): %d", uri, rv);
+
+	if (!rv) {
+		snprintf(uri, MONITOR_MAX_STR_SZ, "tcp://%s:%d",
+				ctx->conf.address, ctx->conf.ctl_port);
+		rv |= zmq_connect(ctx->zmq_ctl_sock, uri);
+		debug("control --> zmq_connect(%s): %d", uri, rv);
+	}
+
+	return rv;
+}
+
+static int receive_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt)
+{
+	char buf[sizeof(struct monitor_ctl_pkt_s)];
+
+	if (zmq_recv(ctx->zmq_ctl_sock, buf, sizeof(struct monitor_ctl_pkt_s), 0) > 0) {
+		unmarshall_monitor_ctl_pkt(buf, pkt);
+		debug("received command %d", pkt->command);
+		dump_raw_pkt(buf);
+	}
+
+	return 0;
+}
+
+static int process_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt)
+{
+	switch (pkt->command) {
+	case MONITOR_CMD_DUMMY:
+		info("processed MONITOR_CMD_DUMMY");
+		break;
+
+	case MONITOR_CMD_GRACEFULL_KILL:
+		need_run = 0;
+		info("processed MONITOR_CMD_GRACEFULL_KILL -- will shutdown!!!");
+		break;
+
+	case MONITOR_CMD_KILL:
+		info("processed MONITOR_CMD_KILL -- use brute force, will shutdown!!!");
+		kill(getpid(), SIGKILL);
+		break;
+
+	default:
+		debug("unknown command %d", pkt->command);
+		return 1;
+	}
+
+	return 0;
+}
+
+static void *errgen_ctl_thread(void *arg)
+{
+	struct errgen_ctx *ctx = (struct errgen_ctx *)arg;
+	struct monitor_ctl_pkt_s pkt;
+
+	while (need_run) {
+		if (receive_command(ctx, &pkt)) {
+			process_command(ctx, &pkt);
+		}
+		sleep(1);
+	}
+
+	info("exiting control thread...");
+
+	return NULL;
+}
+
+static void errgen_start_ctl_loop(struct errgen_ctx *ctx)
+{
+	pthread_create(&ctx->ctl_thread, NULL, errgen_ctl_thread, ctx);
 }
 
 static void get_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
@@ -249,11 +315,10 @@ static void get_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
 	struct timeval tv = {0};
 
 	gettimeofday(&tv, NULL);
-	pkt->pid = ctx->pid;
 	pkt->errcode = ctx->cnt++;
 	pkt->tv_sec = tv.tv_sec;
 	pkt->tv_usec = tv.tv_usec;
-	memcpy(pkt->detector, ctx->conf.uuid, MAX_UUID_LEN);
+	memcpy(pkt->detector, ctx->conf.uuid, sizeof(ctx->conf.uuid));
 }
 
 static int send_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
@@ -262,7 +327,9 @@ static int send_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
 
 	debug("sending report #%d", ctx->cnt);
 	marshall_monitor_pkt(pkt, buf);
+	dump_raw_pkt(buf);
 	zmq_send(ctx->zmq_sock, buf, sizeof(struct monitor_pkt_s), 0);
+
 	return 0;
 }
 
@@ -280,8 +347,14 @@ static void errgen_loop(struct errgen_ctx *ctx)
 
 static void cleanup(struct errgen_ctx *ctx)
 {
+	if (!pthread_join(ctx->ctl_thread, NULL)) {
+		error("pthread_join()");
+	}
 	if (ctx->zmq_sock) {
 		zmq_close(ctx->zmq_sock);
+	}
+	if (ctx->zmq_ctl_sock) {
+		zmq_close(ctx->zmq_ctl_sock);
 	}
 	if (ctx->zmq_ctx) {
 		zmq_ctx_destroy(ctx->zmq_ctx);
@@ -294,7 +367,7 @@ static void cleanup(struct errgen_ctx *ctx)
 
 int main(int argc, char *argv[])
 {
-	struct errgen_ctx *ctx;
+	struct errgen_ctx *ctx = NULL;
 
 	ctx = (struct errgen_ctx *)malloc(sizeof(*ctx));
 	if (!ctx) {
@@ -314,6 +387,7 @@ int main(int argc, char *argv[])
 		exit(3);
 	}
 
+	errgen_start_ctl_loop(ctx);
 	errgen_loop(ctx);
 
 	info("terminating...");

@@ -1,8 +1,8 @@
 
 all:
-	gcc errgen.c msgproto.c -g -o errgen -lzmq
-	gcc monitor.c msgproto.c -g -o monitor -lzmq -lpthread
+	gcc errgen.c errgencfg.c msgproto.c -o errgen -lzmq
+	gcc monitor.c monitorcfg.c msgproto.c -o monitor -lzmq -lpthread
 
 clean:
-	rm errgen monitor
+	rm -f errgen monitor *.o
 
