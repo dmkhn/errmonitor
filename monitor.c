@@ -261,7 +261,7 @@ static int setup_connection(struct monitor_ctx *ctx)
 		return -1;
 	}
 
-	ctx->zmq_sock = zmq_socket(ctx->zmq_ctx, ZMQ_REQ);
+	ctx->zmq_sock = zmq_socket(ctx->zmq_ctx, ZMQ_PULL);
 	if (!ctx->zmq_sock) {
 		error("failed to create zmq socket");
 		return -1;
@@ -287,29 +287,31 @@ static int setup_connection(struct monitor_ctx *ctx)
 
 static int receive_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 {
-	struct monitor_rsp_pkt_s rsp;
-	char buf[sizeof(struct monitor_pkt_s)];
+	char buf[512];
 	int rv;
 
-	rv = zmq_recv(ctx->zmq_sock, buf, sizeof(*pkt), 0);
-	if (rv > 0) {
-		unmarshall_monitor_pkt(buf, pkt);
+	zmq_pollitem_t items[] = {
+		{ ctx->zmq_sock, 0, ZMQ_POLLIN, 0 },
+	};
+
+	zmq_poll(items, 1, -1);
+	if (items[0].revents & ZMQ_POLLIN) {
+		rv = zmq_recv(ctx->zmq_sock, buf, sizeof(*pkt), 0);
+		if (rv == sizeof(*pkt)) {
+			dump_raw_pkt(buf,  sizeof(*pkt));
+			unmarshall_monitor_pkt(buf, pkt);
+			info("got report from [%s] --> %d", pkt->detector, pkt->errcode);
+			return 1;
+		}
 	}
 
-	rsp.response = MONITOR_RSP_OK;
-	rsp.errcode = pkt->errcode;
-	memcpy(rsp.detector, pkt->detector, sizeof(rsp.detector));
-	marshall_monitor_rsp_pkt(&rsp, buf);
-	zmq_send(ctx->zmq_sock, buf, sizeof(rsp), 0);
-
-	return 1;
+	return 0;
 }
 
 static int take_corrective_action(struct monitor_ctx *ctx,
 		struct client_s *client)
 {
 	struct monitor_ctl_pkt_s ctlpkt;
-	struct monitor_ctl_rsp_pkt_s ctlrsp;
 	char msg[sizeof(struct monitor_ctl_pkt_s)];
 
 	if (client->errcnt > ctx->conf.err_threshold) {
@@ -361,6 +363,7 @@ static void *client_monitor(void *arg)
 		}
 
 		if (take_corrective_action(ctx, client)) {
+			info("removing client %s", client->detector);
 			TAILQ_REMOVE(&ctx->clients, client, next);
 			free(client);
 			break;
@@ -399,10 +402,6 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 	int not_processed = 1, ret;
 	struct client_s *client;
 
-	if (pkt->errcode == -1) {
-		return 0;
-	}
-
 	ret = pthread_mutex_lock(&ctx->mutex);
 	if (ret) {
 		error("pthread_mutex_lock(): %s", strerror(ret));
@@ -412,7 +411,7 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 	if (!TAILQ_EMPTY(&ctx->clients)) {
 		TAILQ_FOREACH(client, &ctx->clients, next) {
 			if (!strcmp(client->detector, pkt->detector)) {
-				info("processing client %s errcnt=%d", client->detector, client->errcnt);
+				info("processing client %s:%d (errcnt=%d)", client->detector, pkt->errcode, client->errcnt);
 				client->errcnt++;
 				not_processed = 0;
 			}
@@ -420,7 +419,7 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 	}
 
 	if (not_processed) {
-		info("adding new client %s", pkt->detector);
+		info("adding client [%s]", pkt->detector);
 		client = add_new_client(ctx, pkt);
 		if (client) {
 			client->errcnt++;
@@ -450,7 +449,6 @@ static void monitor_loop(struct monitor_ctx *ctx)
 	struct monitor_pkt_s pkt;
 
 	while (need_run) {
-		pkt.errcode = -1;
 		if (receive_report(ctx, &pkt)) {
 			process_report(ctx, &pkt);
 		}

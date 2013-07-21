@@ -224,7 +224,7 @@ static int connect_to_server(struct errgen_ctx *ctx)
 		return -1;
 	}
 
-	ctx->zmq_sock = zmq_socket(ctx->zmq_ctx, ZMQ_REQ);
+	ctx->zmq_sock = zmq_socket(ctx->zmq_ctx, ZMQ_PUSH);
 	if (!ctx->zmq_sock) {
 		error("failed to create zmq socket");
 		return -1;
@@ -235,7 +235,7 @@ static int connect_to_server(struct errgen_ctx *ctx)
 		error("failed to create zmq control socket");
 		return -1;
 	}
-	zmq_setsockopt(ctx->zmq_ctl_sock, ZMQ_SUBSCRIBE, NULL, 0);
+	zmq_setsockopt(ctx->zmq_ctl_sock, ZMQ_SUBSCRIBE, "", 0);
 
 	snprintf(uri, MONITOR_MAX_STR_SZ, "tcp://%s:%d",
 			ctx->conf.address, ctx->conf.port);
@@ -256,17 +256,15 @@ static int receive_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt
 {
 	char buf[sizeof(struct monitor_ctl_pkt_s)];
 	int rv;
-	struct monitor_ctl_rsp_pkt_s rsp;
 
 	info("listening for command");
 	zmq_recv(ctx->zmq_ctl_sock, buf, sizeof(*pkt), 0);
 
-		unmarshall_monitor_ctl_pkt(buf, pkt);
-		info("received command %d", pkt->command);
-		dump_raw_pkt(buf, sizeof(*pkt));
+	unmarshall_monitor_ctl_pkt(buf, pkt);
+	info("received command %d", pkt->command);
+	dump_raw_pkt(buf, sizeof(*pkt));
 
-		return 1;
-
+	return 1;
 }
 
 static int process_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt)
@@ -321,38 +319,23 @@ static void errgen_start_ctl_loop(struct errgen_ctx *ctx)
 
 static void get_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
 {
-	struct timeval tv = {0};
-
-	gettimeofday(&tv, NULL);
-	pkt->errcode = ctx->cnt++;
-	pkt->tv_sec = tv.tv_sec;
-	pkt->tv_usec = tv.tv_usec;
+	pkt->errcode = ctx->cnt;
 	memcpy(pkt->detector, ctx->conf.uuid, sizeof(ctx->conf.uuid));
 }
 
 static void send_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
 {
-	char buf[sizeof(struct monitor_pkt_s)];
-	struct monitor_rsp_pkt_s rsp;
+	char buf[512];
 
-	debug("sending report #%d", ctx->cnt);
+	info("sending report #%d", ctx->cnt);
 	marshall_monitor_pkt(pkt, buf);
 	dump_raw_pkt(buf, sizeof(*pkt));
 	zmq_send(ctx->zmq_sock, buf, sizeof(*pkt), 0);
-
-	zmq_recv(ctx->zmq_sock, buf, sizeof(rsp), 0);
-	unmarshall_monitor_rsp_pkt(buf, &rsp);
-
-	if (rsp.response == MONITOR_RSP_OK &&
-			!strncmp(rsp.detector, pkt->detector, sizeof(rsp.detector))) {
-		info("report %d received", rsp.errcode);
-	}
-
+	ctx->cnt++;
 }
 
 static void errgen_loop(struct errgen_ctx *ctx)
 {
-	pid_t pid = getpid();
 	struct monitor_pkt_s pkt;
 
 	errgen_start_ctl_loop(ctx);
