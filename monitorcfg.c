@@ -1,2 +1,2 @@
 
-int verbosity = 2;
+int verbosity = 1;

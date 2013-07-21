@@ -76,7 +76,7 @@ static int parse_command_line(struct errgen_cfg *cfg,
 		exit(0);
 	}
 
-	while ((opt = getopt_long(argc, argv, "vhgupat:",
+	while ((opt = getopt_long(argc, argv, "vhg:upat:",
 			long_options, NULL)) != -1) {
 		switch(opt) {
 		case 'h':
@@ -118,7 +118,7 @@ static int parse_command_line(struct errgen_cfg *cfg,
 			break;
 
 		case 't':
-			cfg->port = atoi(optarg);
+			cfg->timeout = atoi(optarg);
 			break;
 
 		default:
@@ -230,11 +230,12 @@ static int connect_to_server(struct errgen_ctx *ctx)
 		return -1;
 	}
 
-	ctx->zmq_ctl_sock = zmq_socket(ctx->zmq_ctx, ZMQ_REQ);
+	ctx->zmq_ctl_sock = zmq_socket(ctx->zmq_ctx, ZMQ_SUB);
 	if (!ctx->zmq_ctl_sock) {
 		error("failed to create zmq control socket");
 		return -1;
 	}
+	zmq_setsockopt(ctx->zmq_ctl_sock, ZMQ_SUBSCRIBE, NULL, 0);
 
 	snprintf(uri, MONITOR_MAX_STR_SZ, "tcp://%s:%d",
 			ctx->conf.address, ctx->conf.port);
@@ -254,18 +255,26 @@ static int connect_to_server(struct errgen_ctx *ctx)
 static int receive_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt)
 {
 	char buf[sizeof(struct monitor_ctl_pkt_s)];
+	int rv;
+	struct monitor_ctl_rsp_pkt_s rsp;
 
-	if (zmq_recv(ctx->zmq_ctl_sock, buf, sizeof(struct monitor_ctl_pkt_s), 0) > 0) {
+	info("listening for command");
+	zmq_recv(ctx->zmq_ctl_sock, buf, sizeof(*pkt), 0);
+
 		unmarshall_monitor_ctl_pkt(buf, pkt);
-		debug("received command %d", pkt->command);
-		dump_raw_pkt(buf);
-	}
+		info("received command %d", pkt->command);
+		dump_raw_pkt(buf, sizeof(*pkt));
 
-	return 0;
+		return 1;
+
 }
 
 static int process_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt)
 {
+	if (pkt->command == -1) {
+		return 1;
+	}
+
 	switch (pkt->command) {
 	case MONITOR_CMD_DUMMY:
 		info("processed MONITOR_CMD_DUMMY");
@@ -295,12 +304,11 @@ static void *errgen_ctl_thread(void *arg)
 	struct monitor_ctl_pkt_s pkt;
 
 	while (need_run) {
+		pkt.command = -1;
 		if (receive_command(ctx, &pkt)) {
 			process_command(ctx, &pkt);
 		}
-		sleep(1);
 	}
-
 	info("exiting control thread...");
 
 	return NULL;
@@ -322,16 +330,24 @@ static void get_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
 	memcpy(pkt->detector, ctx->conf.uuid, sizeof(ctx->conf.uuid));
 }
 
-static int send_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
+static void send_report(struct errgen_ctx *ctx, struct monitor_pkt_s *pkt)
 {
 	char buf[sizeof(struct monitor_pkt_s)];
+	struct monitor_rsp_pkt_s rsp;
 
 	debug("sending report #%d", ctx->cnt);
 	marshall_monitor_pkt(pkt, buf);
-	dump_raw_pkt(buf);
-	zmq_send(ctx->zmq_sock, buf, sizeof(struct monitor_pkt_s), 0);
+	dump_raw_pkt(buf, sizeof(*pkt));
+	zmq_send(ctx->zmq_sock, buf, sizeof(*pkt), 0);
 
-	return 0;
+	zmq_recv(ctx->zmq_sock, buf, sizeof(rsp), 0);
+	unmarshall_monitor_rsp_pkt(buf, &rsp);
+
+	if (rsp.response == MONITOR_RSP_OK &&
+			!strncmp(rsp.detector, pkt->detector, sizeof(rsp.detector))) {
+		info("report %d received", rsp.errcode);
+	}
+
 }
 
 static void errgen_loop(struct errgen_ctx *ctx)

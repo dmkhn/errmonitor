@@ -20,6 +20,8 @@ static int need_run = 1;
 #define MAX_UUID_LEN    DETECTOR_SIZE
 #define MAX_ADDRESS_LEN 64
 
+#undef DEBUG_CTL
+
 typedef enum monitor_action {
 	MONITOR_ACTION_IGNORE = 0,
 	MONITOR_ACTION_KILL,
@@ -95,7 +97,7 @@ static int parse_command_line(struct monitor_cfg *cfg,
 		{ NULL, 0, NULL, 0 }
 	};
 
-	while ((opt = getopt_long(argc, argv, "hvd:u:p:a:t",
+	while ((opt = getopt_long(argc, argv, "vhg:pctea:",
 			long_options, NULL)) >= 0) {
 		switch(opt) {
 		case 'h':
@@ -108,7 +110,7 @@ static int parse_command_line(struct monitor_cfg *cfg,
 			exit(0);
 			break;
 
-		case 'd':
+		case 'g':
 			verbosity++;
 			break;
 
@@ -121,12 +123,15 @@ static int parse_command_line(struct monitor_cfg *cfg,
 			break;
 
 		case 't':
-			cfg->port = atoi(optarg);
+			cfg->timeout = atoi(optarg);
 			break;
 
 		case 'a':
 			if (!strcmp(optarg, "kill")) {
 				cfg->action = MONITOR_ACTION_KILL;
+			}
+			if (!strcmp(optarg, "gkill")) {
+				cfg->action = MONITOR_ACTION_GRACEFULL_KILL;
 			}
 			else if (!strcmp(optarg, "ignore")) {
 				cfg->action = MONITOR_ACTION_IGNORE;
@@ -156,6 +161,7 @@ static int parse_command_line(struct monitor_cfg *cfg,
 static int monitor_cfg_init(struct monitor_cfg *cfg)
 {
 	cfg->port = DEFAULT_PORT;
+	cfg->ctl_port = DEFAULT_CTL_PORT;
 	cfg->timeout = MONITOR_DEFAULT_TIMEOUT;
 	cfg->action = MONITOR_ACTION_KILL;
 	cfg->err_threshold = MONITOR_DEFAULT_ERR_THRES;
@@ -249,8 +255,6 @@ static int setup_connection(struct monitor_ctx *ctx)
 	char uri[MAX_ADDRESS_LEN];
 	int rv;
 
-	info("Start listening on port %d...", ctx->conf.port);
-
 	ctx->zmq_ctx = zmq_ctx_new();
 	if (!ctx->zmq_ctx) {
 		error("failed to create zmq context");
@@ -263,15 +267,17 @@ static int setup_connection(struct monitor_ctx *ctx)
 		return -1;
 	}
 
-	ctx->zmq_ctl_sock = zmq_socket(ctx->zmq_ctx, ZMQ_REQ);
+	ctx->zmq_ctl_sock = zmq_socket(ctx->zmq_ctx, ZMQ_PUB);
 	if (!ctx->zmq_ctl_sock) {
 		error("failed to create zmq control socket");
 		return -1;
 	}
 
+	info("Start listening on port %d...", ctx->conf.port);
 	snprintf(uri, MAX_ADDRESS_LEN, "tcp://*:%d", ctx->conf.port);
 	rv = zmq_bind(ctx->zmq_sock, uri);
 	if (!rv) {
+		info("Start listening on control port %d...", ctx->conf.ctl_port);
 		snprintf(uri, MAX_ADDRESS_LEN, "tcp://*:%d", ctx->conf.ctl_port);
 		rv |= zmq_bind(ctx->zmq_ctl_sock, uri);
 	}
@@ -281,21 +287,29 @@ static int setup_connection(struct monitor_ctx *ctx)
 
 static int receive_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 {
+	struct monitor_rsp_pkt_s rsp;
 	char buf[sizeof(struct monitor_pkt_s)];
 	int rv;
 
-	rv = zmq_recv(ctx->zmq_sock, buf, sizeof(struct monitor_pkt_s), 0);
-	if (rv) {
+	rv = zmq_recv(ctx->zmq_sock, buf, sizeof(*pkt), 0);
+	if (rv > 0) {
 		unmarshall_monitor_pkt(buf, pkt);
 	}
 
-	return rv;
+	rsp.response = MONITOR_RSP_OK;
+	rsp.errcode = pkt->errcode;
+	memcpy(rsp.detector, pkt->detector, sizeof(rsp.detector));
+	marshall_monitor_rsp_pkt(&rsp, buf);
+	zmq_send(ctx->zmq_sock, buf, sizeof(rsp), 0);
+
+	return 1;
 }
 
 static int take_corrective_action(struct monitor_ctx *ctx,
 		struct client_s *client)
 {
 	struct monitor_ctl_pkt_s ctlpkt;
+	struct monitor_ctl_rsp_pkt_s ctlrsp;
 	char msg[sizeof(struct monitor_ctl_pkt_s)];
 
 	if (client->errcnt > ctx->conf.err_threshold) {
@@ -312,7 +326,7 @@ static int take_corrective_action(struct monitor_ctx *ctx,
 			memcpy(ctlpkt.detector, client->detector, sizeof(ctlpkt.detector));
 			marshall_monitor_ctl_pkt(&ctlpkt, msg);
 			info("kill client uuid=%s", client->detector);
-			zmq_send(ctx->zmq_ctl_sock, &ctlpkt, sizeof(sizeof(struct monitor_ctl_pkt_s)), 0);
+			zmq_send(ctx->zmq_ctl_sock, msg, sizeof(ctlpkt), 0);
 			break;
 
 		case MONITOR_ACTION_GRACEFULL_KILL:
@@ -320,7 +334,7 @@ static int take_corrective_action(struct monitor_ctx *ctx,
 			memcpy(ctlpkt.detector, client->detector, sizeof(ctlpkt.detector));
 			marshall_monitor_ctl_pkt(&ctlpkt, msg);
 			info("grecefully kill client uuid=%s", client->detector);
-			zmq_send(ctx->zmq_ctl_sock, &ctlpkt, sizeof(sizeof(struct monitor_ctl_pkt_s)), 0);
+			zmq_send(ctx->zmq_ctl_sock, msg, sizeof(ctlpkt), 0);
 			break;
 
 		default:
@@ -385,6 +399,10 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 	int not_processed = 1, ret;
 	struct client_s *client;
 
+	if (pkt->errcode == -1) {
+		return 0;
+	}
+
 	ret = pthread_mutex_lock(&ctx->mutex);
 	if (ret) {
 		error("pthread_mutex_lock(): %s", strerror(ret));
@@ -402,15 +420,27 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 	}
 
 	if (not_processed) {
-		info("adding new client %s", client->detector);
+		info("adding new client %s", pkt->detector);
 		client = add_new_client(ctx, pkt);
 		if (client) {
 			client->errcnt++;
 			not_processed = 0;
 		}
-		exit(0);
 	}
 	pthread_mutex_unlock(&ctx->mutex);
+
+#if DEBUG_CTL
+	{
+		struct monitor_ctl_pkt_s ctlpkt;
+		char msg[sizeof(struct monitor_ctl_pkt_s)];
+
+		ctlpkt.command = MONITOR_CMD_DUMMY;
+		memcpy(ctlpkt.detector, pkt->detector, sizeof(ctlpkt.detector));
+		marshall_monitor_ctl_pkt(&ctlpkt, msg);
+		info("dummy command for client uuid=%s", pkt->detector);
+		zmq_send(ctx->zmq_ctl_sock, &ctlpkt, sizeof(ctlpkt), 0);
+	}
+#endif
 
 	return !not_processed;
 }
@@ -420,6 +450,7 @@ static void monitor_loop(struct monitor_ctx *ctx)
 	struct monitor_pkt_s pkt;
 
 	while (need_run) {
+		pkt.errcode = -1;
 		if (receive_report(ctx, &pkt)) {
 			process_report(ctx, &pkt);
 		}

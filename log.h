@@ -44,6 +44,5 @@ error(const char *fmt, ...)
 
 #define info(...) do_log(1, __VA_ARGS__)
 #define debug(...) do_log(2, __VA_ARGS__)
-#define verbose(...) do_log(3, __VA_ARGS__)
 
 #endif /* __LOG_H__ */
