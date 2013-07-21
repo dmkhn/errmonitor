@@ -14,7 +14,7 @@
 #define ERRGEN_DEFAULT_SYSLOGNAME  "errgen"
 #define ERRGEN_DEFAULT_TIMEOUT     5 // 5sec
 
-static int need_run = 1;
+static volatile int need_run = 1;
 
 #define MAX_UUID_LEN    DETECTOR_SIZE
 #define MAX_ADDRESS_LEN 64
@@ -256,20 +256,28 @@ static int receive_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt
 {
 	char buf[sizeof(struct monitor_ctl_pkt_s)];
 	int rv;
+	zmq_pollitem_t items[] = {
+		{ ctx->zmq_ctl_sock, 0, ZMQ_POLLIN, 0 },
+	};
 
-	info("listening for command");
-	zmq_recv(ctx->zmq_ctl_sock, buf, sizeof(*pkt), 0);
+	zmq_poll(items, 1, ZMQ_POLL_TIMEOUT_MAX);
+	if (items[0].revents & ZMQ_POLLIN) {
+		rv = zmq_recv(ctx->zmq_ctl_sock, buf, sizeof(*pkt), 0);
+		if (rv == sizeof(*pkt)) {
+			unmarshall_monitor_ctl_pkt(buf, pkt);
+			debug("received command %d for client %s", pkt->command, pkt->detector);
+			dump_raw_pkt(buf, sizeof(*pkt));
+			return 1;
+		}
+	}
 
-	unmarshall_monitor_ctl_pkt(buf, pkt);
-	info("received command %d", pkt->command);
-	dump_raw_pkt(buf, sizeof(*pkt));
-
-	return 1;
+	return 0;
 }
 
 static int process_command(struct errgen_ctx *ctx, struct monitor_ctl_pkt_s *pkt)
 {
-	if (pkt->command == -1) {
+	if (strncmp(pkt->detector, ctx->conf.uuid, sizeof(pkt->detector))) {
+		debug("ignoring command request for %s", pkt->detector);
 		return 1;
 	}
 
@@ -302,7 +310,6 @@ static void *errgen_ctl_thread(void *arg)
 	struct monitor_ctl_pkt_s pkt;
 
 	while (need_run) {
-		pkt.command = -1;
 		if (receive_command(ctx, &pkt)) {
 			process_command(ctx, &pkt);
 		}
@@ -348,9 +355,13 @@ static void errgen_loop(struct errgen_ctx *ctx)
 
 static void cleanup(struct errgen_ctx *ctx)
 {
-	if (!pthread_join(ctx->ctl_thread, NULL)) {
-		error("pthread_join()");
+	int ret;
+
+	ret = pthread_join(ctx->ctl_thread, NULL);
+	if (ret) {
+		error("pthread_join(): %s", strerror(ret));
 	}
+
 	if (ctx->zmq_sock) {
 		zmq_close(ctx->zmq_sock);
 	}

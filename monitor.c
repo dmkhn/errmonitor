@@ -8,6 +8,7 @@
 #include <getopt.h>
 #include <pthread.h>
 
+#include "common.h"
 #include "log.h"
 #include "msgproto.h"
 
@@ -49,6 +50,7 @@ struct client_s {
 	int errcnt;
 	pthread_t thread;
 	struct thread_arg arg;
+	int need_run;
 	TAILQ_ENTRY(client_s) next;
 };
 
@@ -138,6 +140,7 @@ static int parse_command_line(struct monitor_cfg *cfg,
 			}
 			else {
 				fprintf(stderr, "ERROR: unknown action '%s'\n", optarg);
+				return -1;
 			}
 			break;
 
@@ -294,7 +297,7 @@ static int receive_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 		{ ctx->zmq_sock, 0, ZMQ_POLLIN, 0 },
 	};
 
-	zmq_poll(items, 1, -1);
+	zmq_poll(items, 1, ZMQ_POLL_TIMEOUT_MAX);
 	if (items[0].revents & ZMQ_POLLIN) {
 		rv = zmq_recv(ctx->zmq_sock, buf, sizeof(*pkt), 0);
 		if (rv == sizeof(*pkt)) {
@@ -308,7 +311,7 @@ static int receive_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 	return 0;
 }
 
-static int take_corrective_action(struct monitor_ctx *ctx,
+static void check_client(struct monitor_ctx *ctx,
 		struct client_s *client)
 {
 	struct monitor_ctl_pkt_s ctlpkt;
@@ -320,7 +323,6 @@ static int take_corrective_action(struct monitor_ctx *ctx,
 		switch (ctx->conf.action) {
 		case MONITOR_ACTION_IGNORE:
 			info("ignoring error rate from client uuid=%s", client->detector);
-			client->errcnt = 0;
 			break;
 
 		case MONITOR_ACTION_KILL:
@@ -329,22 +331,25 @@ static int take_corrective_action(struct monitor_ctx *ctx,
 			marshall_monitor_ctl_pkt(&ctlpkt, msg);
 			info("kill client uuid=%s", client->detector);
 			zmq_send(ctx->zmq_ctl_sock, msg, sizeof(ctlpkt), 0);
+			client->need_run = 0;
 			break;
 
 		case MONITOR_ACTION_GRACEFULL_KILL:
 			ctlpkt.command = MONITOR_CMD_GRACEFULL_KILL;
 			memcpy(ctlpkt.detector, client->detector, sizeof(ctlpkt.detector));
 			marshall_monitor_ctl_pkt(&ctlpkt, msg);
-			info("grecefully kill client uuid=%s", client->detector);
+			info("gracefully kill client uuid=%s", client->detector);
 			zmq_send(ctx->zmq_ctl_sock, msg, sizeof(ctlpkt), 0);
+			client->need_run = 0;
 			break;
 
 		default:
-			return 0;
+			break;
 		}
 	}
 
-	return 1;
+	info("clearing errcnt for client %s", client->detector);
+	client->errcnt = 0;
 }
 
 static void *client_monitor(void *arg)
@@ -354,28 +359,17 @@ static void *client_monitor(void *arg)
 	struct monitor_ctx *ctx = targ->ctx;
 	int ret;
 
-	while (need_run) {
+	while (need_run && client->need_run) {
 		sleep(ctx->conf.timeout);
-		ret = pthread_mutex_lock(&ctx->mutex);
-		if (ret) {
-			error("pthread_mutex_lock(): %s", strerror(ret));
-			return NULL;
-		}
-
-		if (take_corrective_action(ctx, client)) {
-			info("removing client %s", client->detector);
-			TAILQ_REMOVE(&ctx->clients, client, next);
-			free(client);
-			break;
-		}
-
-		ret = pthread_mutex_lock(&ctx->mutex);
+		check_client(ctx, client);
 	}
+
+	info("leaving monitor for client %s...", client->detector);
 
 	return NULL;
 }
 
-static struct client_s *add_new_client(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
+static struct client_s *add_client(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 {
 	struct client_s *client;
 
@@ -386,6 +380,7 @@ static struct client_s *add_new_client(struct monitor_ctx *ctx, struct monitor_p
 	}
 	client->arg.client = client;
 	client->arg.ctx = ctx;
+	client->need_run = 1;
 
 	memcpy(client->detector, pkt->detector, sizeof(client->detector));
 	client->errcnt = 0;
@@ -395,6 +390,19 @@ static struct client_s *add_new_client(struct monitor_ctx *ctx, struct monitor_p
 	pthread_create(&client->thread, NULL, client_monitor, &client->arg);
 
 	return client;
+}
+
+static void remove_client(struct monitor_ctx *ctx, struct client_s *client)
+{
+	int ret;
+
+	info("removing client %s", client->detector);
+	ret = pthread_join(client->thread, NULL);
+	if (ret) {
+		error("pthread_join(): %s", strerror(ret));
+	}
+	TAILQ_REMOVE(&ctx->clients, client, next);
+	free(client);
 }
 
 static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
@@ -410,17 +418,21 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 
 	if (!TAILQ_EMPTY(&ctx->clients)) {
 		TAILQ_FOREACH(client, &ctx->clients, next) {
-			if (!strcmp(client->detector, pkt->detector)) {
-				info("processing client %s:%d (errcnt=%d)", client->detector, pkt->errcode, client->errcnt);
+			if (!client->need_run) {
+				not_processed = 0;
+				break;
+			}
+			if (!strncmp(client->detector, pkt->detector, sizeof(client->detector))) {
 				client->errcnt++;
 				not_processed = 0;
+				info("processing client %s:%d (errcnt=%d)", client->detector, pkt->errcode, client->errcnt);
 			}
 		}
 	}
 
 	if (not_processed) {
 		info("adding client [%s]", pkt->detector);
-		client = add_new_client(ctx, pkt);
+		client = add_client(ctx, pkt);
 		if (client) {
 			client->errcnt++;
 			not_processed = 0;
@@ -444,6 +456,28 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 	return !not_processed;
 }
 
+static void check_clients(struct monitor_ctx *ctx)
+{
+	int ret;
+	struct client_s *client;
+
+	ret = pthread_mutex_lock(&ctx->mutex);
+	if (ret) {
+		error("pthread_mutex_lock(): %s", strerror(ret));
+		return;
+	}
+
+	if (!TAILQ_EMPTY(&ctx->clients)) {
+		TAILQ_FOREACH(client, &ctx->clients, next) {
+			if (!client->need_run) {
+				remove_client(ctx, client);
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&ctx->mutex);
+}
+
 static void monitor_loop(struct monitor_ctx *ctx)
 {
 	struct monitor_pkt_s pkt;
@@ -452,6 +486,7 @@ static void monitor_loop(struct monitor_ctx *ctx)
 		if (receive_report(ctx, &pkt)) {
 			process_report(ctx, &pkt);
 		}
+		check_clients(ctx);
 	}
 }
 
@@ -470,14 +505,13 @@ static void cleanup(struct monitor_ctx *ctx)
 		zmq_ctx_destroy(ctx->zmq_ctx);
 	}
 
-	while ((client = TAILQ_FIRST(&ctx->clients))) {
-		ret = pthread_join(client->thread, NULL);
-		if (ret) {
-			error("pthread_join(): %s", strerror(ret));
+	if (!TAILQ_EMPTY(&ctx->clients)) {
+		TAILQ_FOREACH(client, &ctx->clients, next) {
+			client->need_run = 0;
 		}
-
-		TAILQ_REMOVE(&ctx->clients, client, next);
-		free(client);
+		TAILQ_FOREACH(client, &ctx->clients, next) {
+			remove_client(ctx, client);
+		}
 	}
 
 	if (ctx) {
