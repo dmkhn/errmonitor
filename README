@@ -1,0 +1,28 @@
+errmonitor
+==========
+
+Code location: https://github.com/v1nx/errmonitor
+Tested on Ubuntu 12.04 LTS with a custom 3.8.0-rc7 kernel image.
+
+Short description
+=================
+
+There's server side - error report monitor (monitor.c) and error report generator - errgen.c
+Both are configurable through a set of command line options, short help for command line options is also available though '--help'.
+
+Clients are handled through a special list which stores information about error occurence for particular client.
+Clients are identified by unique ID.
+Server creates two ZMQ sockets - one for publishing control commands to client and another for pulling error reports from client.
+Error report processing is happenning in the main thread.
+When a report from a new client is received a new entry containing client info is created and added to the clients list.
+Also a separate thread is created which is in charge of checking whether corrective action has to be performed.
+
+Client uses two ZMQ sockets - one is used for subscribing to control events from the server, another is used for pushing reports to server.
+Error report generation is happennig in the main thread, handling of control events is happening in a separate thread.
+
+Unit test
+=========
+
+Run ./test.sh - /var/log/syslog messages will be shown in the terminal
+Run ./kill.sh to terminate all instances of monitor/errgen
+

@@ -18,3 +18,7 @@
 
 *.cproject
 *.project
+
+errgen
+monitor
+

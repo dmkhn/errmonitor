@@ -1,3 +1,22 @@
+/*
+ *   monitor.c - Error monitor
+ *   Copyright (C) 2013 Denis Mukhin <dennis.mukhin@gmail.com>
+ *
+ *   This library is free software; you can redistribute it and/or
+ *   modify it under the terms of the GNU Lesser General Public
+ *   License as published by the Free Software Foundation; either
+ *   version 2.1 of the License, or (at your option) any later version.
+ *
+ *   This library is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *   Lesser General Public License for more details.
+ *
+ *   You should have received a copy of the GNU Lesser General Public
+ *   License along with this library; if not, write to the Free Software
+ *   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
+
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
@@ -10,7 +29,7 @@
 
 #include "common.h"
 #include "log.h"
-#include "msgproto.h"
+#include "monitorpkt.h"
 
 #define MONITOR_DEFAULT_SYSLOGNAME  "monitor"
 #define MONITOR_DEFAULT_TIMEOUT     20 // 20sec
@@ -74,13 +93,13 @@ static void print_version(const char *argv0) {
 static void print_help(const char *argv0) {
 	printf(
 		"%s [options]\n"
-		"    -h --help                   Show this help\n"
-		"    -v --version                Show version\n"
-		"    -p --port=NUM               Set monitor port\n"
-		"    -t --timeout=NUM            Set timeout (secs) to take corrective action\n"
-		"    -e --err-threshold=NUM      Set threshold value for number of errors per client\n"
-		"    -a --action={kill|ignore}   Set default corrective action for client\n"
-		"    -g --debug                  Increase output verbosity\n"
+		"    -h --help                          Show this help\n"
+		"    -v --version                       Show version\n"
+		"    -p --port=NUM                      Set monitor port\n"
+		"    -t --timeout=NUM                   Set timeout (secs) to take corrective action\n"
+		"    -e --err-threshold=NUM             Set threshold value for number of errors per client\n"
+		"    -a --action={kill|gkill||ignore}   Set default corrective action for client\n"
+		"    -g --debug                         Increase output verbosity\n"
 		"\n", argv0);
 }
 
@@ -99,7 +118,7 @@ static int parse_command_line(struct monitor_cfg *cfg,
 		{ NULL, 0, NULL, 0 }
 	};
 
-	while ((opt = getopt_long(argc, argv, "vhg:pctea:",
+	while ((opt = getopt_long(argc, argv, "vhg:p:c:t:e:a:",
 			long_options, NULL)) >= 0) {
 		switch(opt) {
 		case 'h':
@@ -132,7 +151,7 @@ static int parse_command_line(struct monitor_cfg *cfg,
 			if (!strcmp(optarg, "kill")) {
 				cfg->action = MONITOR_ACTION_KILL;
 			}
-			if (!strcmp(optarg, "gkill")) {
+			else if (!strcmp(optarg, "gkill")) {
 				cfg->action = MONITOR_ACTION_GRACEFULL_KILL;
 			}
 			else if (!strcmp(optarg, "ignore")) {
@@ -369,7 +388,8 @@ static void *client_monitor(void *arg)
 	return NULL;
 }
 
-static struct client_s *add_client(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
+static struct client_s *add_client(struct monitor_ctx *ctx,
+		struct monitor_pkt_s *pkt)
 {
 	struct client_s *client;
 
@@ -422,10 +442,12 @@ static int process_report(struct monitor_ctx *ctx, struct monitor_pkt_s *pkt)
 				not_processed = 0;
 				break;
 			}
-			if (!strncmp(client->detector, pkt->detector, sizeof(client->detector))) {
+			if (!strncmp(client->detector, pkt->detector,
+					sizeof(client->detector))) {
 				client->errcnt++;
 				not_processed = 0;
-				info("processing client %s:%d (errcnt=%d)", client->detector, pkt->errcode, client->errcnt);
+				info("processing client %s:%d (errcnt=%d)",
+						client->detector, pkt->errcode, client->errcnt);
 			}
 		}
 	}
